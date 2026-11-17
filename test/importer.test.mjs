@@ -1,5 +1,9 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { runBatch } from "../lib/importer.mjs";
 import { normalizeWorkerResult, loginHTTPAccount } from "../lib/dsh-http-auth.mjs";
 import { GPTFreePoolPlugin } from "../index.mjs";
@@ -154,6 +158,58 @@ test("bridge sends login credentials through stdin, not process argv", async () 
   assert(!JSON.stringify(args).includes("never-in-argv"));
   assert.equal(JSON.parse(options.input).password, "never-in-argv");
   assert.equal(result.tokens.access, "platform-token");
+});
+
+test("login cancelled while Python initializes does not start an authentication worker", async () => {
+  const controller = new AbortController();
+  let ready;
+  const setup = new Promise((resolve) => { ready = resolve; });
+  let calls = 0;
+  const login = loginHTTPAccount({ email: "cancel@example.com", password: "p" }, {
+    signal: controller.signal,
+    python: () => setup,
+    worker: async () => { calls++; return '{"ok":true,"access_token":"unused"}'; },
+  });
+  controller.abort();
+  await assert.rejects(login, { name: "AbortError" });
+  ready("/private/python");
+  await delay(0);
+  assert.equal(calls, 0);
+});
+
+test("cancelled authentication settles only after its worker exits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "gptfree-auth-worker-"));
+  const workerPath = join(root, "auth.mjs");
+  const pidFile = join(root, "pid");
+  const controller = new AbortController();
+  let outcome;
+  try {
+    await writeFile(workerPath, `import { writeFileSync } from "node:fs";
+process.stdin.resume();
+if (process.platform !== "win32") process.on("SIGTERM", () => {});
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`);
+    const login = loginHTTPAccount({ email: "cancel@example.com", password: "p" }, {
+      signal: controller.signal, python: async () => process.execPath, workerPath,
+    });
+    outcome = assert.rejects(login, { name: "AbortError" });
+    let pid;
+    const deadline = performance.now() + 5000;
+    while (!pid && performance.now() < deadline) {
+      try { pid = Number(await readFile(pidFile, "utf8")); }
+      catch (err) { if (err.code !== "ENOENT") throw err; }
+      if (!pid) await delay(10);
+    }
+    assert(pid, "the worker must start before cancellation");
+    controller.abort();
+    await outcome;
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  } finally {
+    controller.abort();
+    await outcome;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Magpie provider still exposes its native in-app import entry", async () => {

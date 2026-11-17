@@ -60,6 +60,7 @@ test("unexpired JWT is only admitted after real Codex model probe", async () => 
   const token = jwt(3600);
   const success = await verifyAccessToken(token, {
     expectedEmail: "a@example.com",
+    signal: new AbortController().signal,
     fetcher: async (url, opts) => {
       requested = url;
       assert.equal(opts.headers.get("authorization"), "Bearer " + token);
@@ -79,6 +80,33 @@ test("unexpired JWT is only admitted after real Codex model probe", async () => 
     fetcher: () => { throw new Error("should not contact server"); } })).reason, "identity_mismatch");
   assert.equal((await verifyAccessToken(token, { fetcher: async () =>
     new Response("{}", { status: 401 }) })).accepted, false);
+});
+
+test("token verification propagates cancellation during fetch and catalog body reads", async (t) => {
+  for (const phase of ["fetch", "body"]) {
+    await t.test(phase, async () => {
+      const controller = new AbortController();
+      const reason = new DOMException("Request cancelled", "AbortError");
+      let started;
+      const waiting = new Promise((resolve) => { started = resolve; });
+      let upstreamSignal;
+      const pending = verifyAccessToken(jwt(3600), {
+        signal: controller.signal,
+        fetcher: async (url, { signal }) => {
+          upstreamSignal = signal;
+          const wait = () => new Promise((resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+            started();
+          });
+          return phase === "fetch" ? wait() : { ok: true, json: wait };
+        },
+      });
+      await waiting;
+      controller.abort(reason);
+      await assert.rejects(pending, (error) => error === reason);
+      assert.equal(upstreamSignal.aborted, true);
+    });
+  }
 });
 
 test("pool mode reuses live token without browser, falls back on rejected/expired", async () => {
@@ -199,7 +227,7 @@ test("discoverPoolModels renews expired multi-account pool and skips failed acco
   assert.equal(models["gpt-image-2"].capabilities.output.image, true);
 });
 
-test("preferredSlot tries the selected Magpie account first in poolFetch and discoverPoolModels, then fails over", async () => {
+test("Magpie slot scopes requests and model discovery to the selected account", async () => {
   const accountA = { email: "alpha@example.com", password: "p", totp: seed, accessToken: jwt(3600, "alpha@example.com") };
   const accountB = { email: "beta@example.com", password: "p", totp: seed, accessToken: jwt(3600, "beta@example.com") };
   const slotB = accountSlotTag(accountB.email);
@@ -219,7 +247,7 @@ test("preferredSlot tries the selected Magpie account first in poolFetch and dis
   assert.equal(okRes.status, 200);
   assert.deepEqual(directAuths, ["Bearer " + accountB.accessToken]);
 
-  // 2. When preferred accountB returns 429, poolFetch fails over to accountA
+  // Magpie needs the original account refusal to route the next account itself.
   const failoverAuths = [];
   const failoverRes = await poolFetch(CODEX_BASE + "/responses",
     { body: '{"model":"gpt-6","input":"hi"}', method: "POST" },
@@ -234,11 +262,9 @@ test("preferredSlot tries the selected Magpie account first in poolFetch and dis
           : new Response("data: failover\n\n", { status: 200 });
       },
     });
-  assert.equal(failoverRes.status, 200);
-  assert.deepEqual(failoverAuths, [
-    "Bearer " + accountB.accessToken,
-    "Bearer " + accountA.accessToken,
-  ]);
+  assert.equal(failoverRes.status, 429);
+  assert.equal(await failoverRes.text(), "rate limited");
+  assert.deepEqual(failoverAuths, ["Bearer " + accountB.accessToken]);
 
   // 3. discoverPoolModels probes preferred slot first
   const probeOrder = [];
@@ -254,6 +280,30 @@ test("preferredSlot tries the selected Magpie account first in poolFetch and dis
     "gpt-6", "gpt-image-2", "gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
   ]);
   assert.deepEqual(probeOrder, ["Bearer " + accountB.accessToken]);
+  const rejected = await discoverPoolModels({
+    read: async () => [accountA, accountB],
+    preferredSlot: slotB,
+    reauthenticate: async (account) => { assert.equal(account, accountB); throw new Error("expired"); },
+    fetcher: async (_url, opts) => {
+      probeOrder.push(opts.headers.get("authorization"));
+      return new Response("{}", { status: 401 });
+    },
+  });
+  assert.deepEqual(rejected, {});
+  assert.deepEqual(probeOrder, ["Bearer " + accountB.accessToken, "Bearer " + accountB.accessToken]);
+
+  let missingCalls = 0;
+  const missingOptions = {
+    read: async () => [accountA], preferredSlot: slotB,
+    fetcher: async () => { missingCalls++; return okModels(); },
+    reauthenticate: async () => { missingCalls++; throw new Error("must not use another slot"); },
+  };
+  const missing = await poolFetch(CODEX_BASE + "/responses", {
+    body: '{"model":"gpt-6","input":"hi"}',
+  }, missingOptions);
+  assert.equal(missing.status, 401);
+  assert.deepEqual(await discoverPoolModels(missingOptions), {});
+  assert.equal(missingCalls, 0);
 
   // 4. GPTFreePoolPlugin wires auth.metadata.poolSlot cleanly into loader & models without throwing
   const plug = await GPTFreePoolPlugin();
@@ -338,4 +388,96 @@ test("expired-token reauthentication refuses unverified Platform OAuth tokens", 
     verify: async () => ({ accepted: false }),
     save: async () => { throw Error("must not save rejected token"); },
   }), /不能用于当前 Magpie 模型接口/);
+});
+
+
+test("shared renewal survives one caller cancelling and stops when its last caller leaves", async () => {
+  const account = { email: "shared-renew@example.com", password: "p", accessToken: jwt(-100) };
+  let finishLogin, loginStarted;
+  const started = new Promise((resolve) => { loginStarted = resolve; });
+  let loginSignal, logins = 0, saves = 0;
+  const options = {
+    proxy: "http://account-proxy:7890",
+    authenticate: async (_account, opts) => {
+      logins++;
+      loginSignal = opts.signal;
+      assert.equal(opts.proxy, options.proxy);
+      loginStarted();
+      return new Promise((resolve, reject) => {
+        finishLogin = () => resolve({ tokens: { access: "renewed" } });
+        opts.signal.addEventListener("abort", () => reject(opts.signal.reason), { once: true });
+      });
+    },
+    verify: async (_token, opts) => {
+      assert.equal(opts.signal, loginSignal);
+      return { accepted: true };
+    },
+    save: async () => { saves++; },
+  };
+  const firstAbort = new AbortController();
+  const first = renewAccount(account, { ...options, signal: firstAbort.signal });
+  await started;
+  const second = renewAccount(account, options);
+  firstAbort.abort();
+  await assert.rejects(first, { name: "AbortError" });
+  assert.equal(loginSignal.aborted, false);
+  finishLogin();
+  assert.equal((await second).accessToken, "renewed");
+  assert.equal(logins, 1);
+  assert.equal(saves, 1);
+
+  const lastAbort = new AbortController();
+  let lastStarted;
+  const active = new Promise((resolve) => { lastStarted = resolve; });
+  const last = renewAccount(account, {
+    ...options,
+    signal: lastAbort.signal,
+    authenticate: async (_account, { signal }) => {
+      loginSignal = signal;
+      lastStarted();
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    },
+  });
+  await active;
+  lastAbort.abort();
+  await assert.rejects(last, { name: "AbortError" });
+  assert.equal(loginSignal.aborted, true);
+  // A retry waits for cleanup, then runs a fresh login rather than joining cancelled work.
+  const retried = await renewAccount(account, {
+    authenticate: async () => ({ tokens: { access: "retry" } }),
+    verify: async () => ({ accepted: true }),
+    save: async () => { saves++; },
+  });
+  assert.equal(retried.accessToken, "retry");
+  assert.equal(saves, 2);
+});
+
+test("a cancelled queued renewal never starts authentication or saves a token", async () => {
+  let release, markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const blocker = renewAccount({ email: "queue-head@example.com" }, {
+    authenticate: async () => {
+      markStarted();
+      await new Promise((resolve) => { release = resolve; });
+      return { tokens: { access: "head" } };
+    },
+    verify: async () => ({ accepted: true }), save: async () => {},
+  });
+  await started;
+  const controller = new AbortController();
+  let calls = 0;
+  const queued = renewAccount({ email: "queue-cancel@example.com" }, {
+    signal: controller.signal,
+    authenticate: async () => { calls++; return { tokens: { access: "cancelled" } }; },
+    verify: async () => ({ accepted: true }), save: async () => { calls++; },
+  });
+  controller.abort();
+  await assert.rejects(queued, { name: "AbortError" });
+  release();
+  await blocker;
+  await renewAccount({ email: "queue-after@example.com" }, {
+    authenticate: async () => ({ tokens: { access: "after" } }),
+    verify: async () => ({ accepted: true }), save: async () => {},
+  });
+  assert.equal(calls, 0);
 });
