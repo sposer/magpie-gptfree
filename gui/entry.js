@@ -20,7 +20,9 @@
     // SAME sandboxed frame to the plugin service; the service hosts the GUI
     // and its own authenticated API.
     const base = magpie.service || ("http://127.0.0.1:" + port + "/");
-    const target = new URL("ui", base);
+    // decision: enter through the service root; not /ui directly because
+    // Magpie retries unavailable root navigations during host handoff.
+    const target = new URL("", base);
     if (target.protocol !== "http:" && target.protocol !== "https:")
       throw new Error("本地服务地址无效");
     if (pendingAction) target.hash = "action=" + pendingAction;

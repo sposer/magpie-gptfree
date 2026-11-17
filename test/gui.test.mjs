@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createGuiService, GUI_PORT } from "../lib/gui-service.mjs";
+import { createGuiService, startGuiServer, GUI_PORT } from "../lib/gui-service.mjs";
+import { createServer } from "node:http";
+import { getEventListeners } from "node:events";
+import { setImmediate as nextTurn, setTimeout as delay } from "node:timers/promises";
 import { createInMemoryStatsStore, recordImageCall, recordQuotaCheck } from "../lib/pool-stats.mjs";
 import { accountSlotTag, formatAccountSlotLabel } from "../lib/pool-connection.mjs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -16,7 +19,7 @@ const future = () => [
 ].join(".");
 
 async function harness(options = {}) {
-  const service = createGuiService({ port: 0, ...options });
+  const service = createGuiService({ port: 0, poolRead: async () => [], sessionFile: false, ...options });
   const addr = await service.listen();
   const base = "http://127.0.0.1:" + addr.port + "/";
   const entry = await fetch(base + "ui");
@@ -34,6 +37,35 @@ async function harness(options = {}) {
     return { status: r.status, json: await r.json() };
   };
   return { service, base, html, token, api, close: async () => service.close() };
+}
+
+async function occupyPort(port = 0) {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  return {
+    port: server.address().port,
+    close: async () => {
+      if (server.listening) await new Promise(resolve => server.close(resolve));
+    },
+  };
+}
+
+async function withTemporaryPool(run) {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-lifecycle-"));
+  const previous = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+  try { await run(); }
+  finally {
+    if (previous === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 test("Magpie GUI manifest points to a real page, provider menu action and a loopback service", async () => {
@@ -490,43 +522,199 @@ test("GUI exposes 额度统计 tab, per-account image quota pills, GET /api/stat
   }
 });
 
+test("GUI lifecycle shares listen and recovers a busy port without listener growth or idle retries", { timeout: 10000 }, async (t) => {
+  const old = await occupyPort();
+  const service = createGuiService({ port: old.port, poolRead: async () => [], sessionFile: false });
+  t.after(async () => { await service.close(); await old.close(); });
+  const originalListen = service.server.listen;
+  let attempts = 0;
+  service.server.listen = function (...args) {
+    attempts++;
+    return originalListen.apply(this, args);
+  };
+  const counts = [];
+  let retried;
+  const retries = new Promise(resolve => { retried = resolve; });
+  const observe = error => {
+    if (error.code !== "EADDRINUSE") return;
+    queueMicrotask(() => {
+      counts.push([service.server.listenerCount("error"), service.server.listenerCount("listening")]);
+      if (counts.length === 3) retried();
+    });
+  };
+  service.server.on("error", observe);
+  const baseline = [service.server.listenerCount("error"), service.server.listenerCount("listening")];
+  const started = service.listen();
+  void started.catch(() => {});
+  assert.equal(service.listen(), started);
+  await retries;
+  assert.deepEqual(counts, [baseline, baseline, baseline]);
+  await old.close();
+  const addr = await started;
+  assert.equal(addr.port, old.port);
+  assert.equal(service.listen(), started);
+  assert.equal(attempts, 4);
+
+  const base = "http://127.0.0.1:" + addr.port + "/";
+  const entry = await fetch(base, { redirect: "manual" });
+  assert.equal(entry.status, 302);
+  assert.equal(entry.headers.get("location"), "ui");
+  await entry.arrayBuffer();
+  assert.equal(service.sessions.size, 0, "root is only a handoff, not another GUI page");
+  const page = await fetch(new URL(entry.headers.get("location"), base));
+  assert.equal(page.status, 200);
+  await page.arrayBuffer();
+  assert.equal(service.sessions.size, 1);
+  await delay(1100);
+  assert.equal(attempts, 4, "successful startup leaves no retry activity");
+  assert.deepEqual([service.server.listenerCount("error"), service.server.listenerCount("listening")], baseline);
+  service.server.off("error", observe);
+});
+
+for (const phase of ["retry delay", "pending bind"]) {
+  test("GUI lifecycle close cancels " + phase + " and never reacquires the port", { timeout: 5000 }, async (t) => {
+    const old = await occupyPort();
+    if (phase === "pending bind") await old.close();
+    const service = createGuiService({ port: old.port, poolRead: async () => [], sessionFile: false });
+    t.after(async () => { await service.close(); await old.close(); });
+    const baseline = [service.server.listenerCount("error"), service.server.listenerCount("listening")];
+    let failed;
+    const busy = new Promise(resolve => { failed = resolve; });
+    if (phase === "retry delay") service.server.once("error", failed);
+    const started = service.listen();
+    const stopped = assert.rejects(started, { code: "ERR_SERVER_CLOSED" });
+    if (phase === "retry delay") {
+      await busy;
+      // Let the EADDRINUSE rejection enter its one-second retry delay.
+      await Promise.resolve();
+    }
+    const closing = service.close();
+    assert.equal(service.closed, true);
+    assert.equal(service.close(), closing);
+    await closing;
+    await stopped;
+    await assert.rejects(service.listen(), { code: "ERR_SERVER_CLOSED" });
+    assert.equal(service.server.listening, false);
+    assert.deepEqual([service.server.listenerCount("error"), service.server.listenerCount("listening")], baseline);
+    await old.close();
+    const replacement = await occupyPort(old.port);
+    try {
+      await delay(1100);
+      assert.equal(service.server.listening, false);
+      assert.deepEqual([service.server.listenerCount("error"), service.server.listenerCount("listening")], baseline);
+    } finally { await replacement.close(); }
+  });
+}
+
+test("GUI lifecycle cleans attempt listeners after a synchronous fatal listen error", async () => {
+  const service = createGuiService({ port: -1, poolRead: async () => [], sessionFile: false });
+  const baseline = [service.server.listenerCount("error"), service.server.listenerCount("listening")];
+  try {
+    const started = service.listen();
+    assert.equal(service.listen(), started);
+    await assert.rejects(started, RangeError);
+    assert.deepEqual([service.server.listenerCount("error"), service.server.listenerCount("listening")], baseline);
+  } finally { await service.close(); }
+});
+
+test("GUI lifecycle singleton shares startup, updates callbacks and isolates caller cancellation", { timeout: 5000 }, async () => {
+  await withTemporaryPool(async () => {
+    const old = await occupyPort();
+    let service;
+    let replacement;
+    try {
+      const cancelled = new AbortController();
+      const completed = new AbortController();
+      const waiting = startGuiServer({ port: old.port, signal: cancelled.signal });
+      const rejected = assert.rejects(waiting, { name: "AbortError" });
+      const first = startGuiServer({ port: old.port, onPoolChange: async () => ({ connected: false, count: 1 }) });
+      const second = startGuiServer({ port: old.port, onPoolChange: async () => ({ connected: true, count: 2 }) });
+      const surviving = startGuiServer({ port: old.port, signal: completed.signal });
+      cancelled.abort();
+      await rejected;
+      assert.equal(getEventListeners(cancelled.signal, "abort").length, 0);
+      await assert.rejects(startGuiServer({ port: old.port, signal: cancelled.signal }), { name: "AbortError" });
+      await old.close();
+      service = await first;
+      assert.equal(await second, service);
+      assert.equal(await surviving, service);
+      assert.equal(getEventListeners(completed.signal, "abort").length, 0);
+      assert.equal(await startGuiServer(), service);
+
+      const base = "http://127.0.0.1:" + old.port + "/";
+      const html = await (await fetch(base + "ui")).text();
+      const token = html.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
+      assert(token);
+      const sync = await fetch(base + "api/sync", {
+        method: "POST",
+        headers: { Origin: "null", "Content-Type": "application/json", "X-GPTFree-Session": token },
+        body: "{}",
+      });
+      assert.equal(sync.status, 200);
+      assert.deepEqual(await sync.json(), { synced: true, connected: true, count: 2 });
+      await service.close();
+      replacement = await startGuiServer({ port: old.port });
+      assert.notEqual(replacement, service);
+      assert.equal(replacement.server.address().port, old.port);
+    } finally {
+      await service?.close();
+      await replacement?.close();
+      await old.close();
+    }
+  });
+});
+
+test("GUI lifecycle singleton recovers after fatal startup and handles failure after caller cancellation", async () => {
+  await withTemporaryPool(async () => {
+    const fatal = new AbortController();
+    await assert.rejects(startGuiServer({ port: -1, signal: fatal.signal }), error => error.cause instanceof RangeError);
+    assert.equal(getEventListeners(fatal.signal, "abort").length, 0);
+    const cancelled = new AbortController();
+    const waiting = startGuiServer({ port: -1, signal: cancelled.signal });
+    const rejected = assert.rejects(waiting, { name: "AbortError" });
+    cancelled.abort();
+    await rejected;
+    assert.equal(getEventListeners(cancelled.signal, "abort").length, 0);
+    // Caller cancellation precedes the host-owned fatal task's settlement.
+    await nextTurn();
+    const service = await startGuiServer({ port: 0 });
+    try { assert.equal(service.server.listening, true); }
+    finally { await service.close(); }
+  });
+});
+
 test("GUI keeps a page usable across a plugin-host restart (persisted capability)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gptfree-session-"));
   const sessionFile = join(dir, "gui-sessions.json");
   const first = createGuiService({ port: 0, sessionFile, poolRead: async () => [] });
-  const addr = await first.listen();
-  const base = "http://127.0.0.1:" + addr.port + "/";
-  let token;
+  let second;
   try {
+    const addr = await first.listen();
+    const base = "http://127.0.0.1:" + addr.port + "/";
     const html = await (await fetch(base + "ui")).text();
-    token = html.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
+    const token = html.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
     assert(token, "the page gets its capability");
-    // The capability is written for the next host process.
-    await new Promise((r) => setTimeout(r, 60));
+    // Closing the host drains queued capability writes, without a timed sleep.
+    await first.close();
     const stored = JSON.parse(await readFile(sessionFile, "utf8"));
     assert.equal(stored.sessions.length, 1);
     assert.equal(stored.sessions[0].id, token);
     assert(!JSON.stringify(stored).includes("@"), "no account data in the session file");
-  } finally {
-    await first.close();
-  }
 
-  // A restarted host (new process, new service) still accepts the open page.
-  const second = createGuiService({ port: 0, sessionFile, poolRead: async () => [] });
-  const addr2 = await second.listen();
-  const base2 = "http://127.0.0.1:" + addr2.port + "/";
-  try {
-    const resumed = await fetch(base2 + "api/accounts", {
+    // A restarted host (new process, new service) accepts the same open page.
+    second = createGuiService({ port: addr.port, sessionFile, poolRead: async () => [] });
+    await second.listen();
+    const resumed = await fetch(base + "api/accounts", {
       headers: { Origin: "null", "X-GPTFree-Session": token },
     });
     assert.equal(resumed.status, 200, "an open page survives a host restart");
-    // A capability never issued by this plugin is still refused.
-    const forged = await fetch(base2 + "api/accounts", {
+    const forged = await fetch(base + "api/accounts", {
       headers: { Origin: "null", "X-GPTFree-Session": "0".repeat(64) },
     });
     assert.equal(forged.status, 403);
   } finally {
-    await second.close();
+    await first.close();
+    await second?.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

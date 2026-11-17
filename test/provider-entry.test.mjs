@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
-import { createGuiService } from "../lib/gui-service.mjs";
+import { createGuiService, startGuiServer } from "../lib/gui-service.mjs";
 import { GPTFreePoolPlugin, GPTFreeGuiPlugin } from "../index.mjs";
 import { nativeImportMethod } from "../lib/provider-native-signin.mjs";
 import { pickAccountTxt, NATIVE_PICKER_COMMANDS } from "../lib/native-file-dialog.mjs";
@@ -20,7 +21,7 @@ async function txtTemp(content = "user@example.com----password----" + seed) {
   return { path, close: () => rm(dir, { recursive: true, force: true }) };
 }
 async function harness(options = {}) {
-  const service = createGuiService({ port: 0, ...options });
+  const service = createGuiService({ port: 0, poolRead: async () => [], ...options });
   const address = await service.listen();
   const base = "http://127.0.0.1:" + address.port;
   const page = await (await fetch(base + "/ui")).text();
@@ -99,6 +100,29 @@ test("clicking plugin immediately opens native picker dialog without prompt butt
   const aborted = await method.authorize(undefined, { signal: ac.signal });
   assert.equal(aborted.type, "failed");
   assert.equal(pickCalls, 2);
+});
+
+test("native provider does not start a late import after its service wait is cancelled", async () => {
+  const controller = new AbortController();
+  let waiting, release;
+  const started = new Promise((resolve) => { waiting = resolve; });
+  const ready = new Promise((resolve) => { release = resolve; });
+  let imports = 0, receivedSignal;
+  const method = nativeImportMethod({
+    picker: async () => "virtual.txt",
+    server: async (options) => {
+      receivedSignal = options?.signal;
+      waiting();
+      return ready;
+    },
+  });
+  const pending = method.authorize(undefined, { signal: controller.signal });
+  await started;
+  controller.abort();
+  release({ startNativeImport: async () => { imports++; } });
+  assert.equal((await pending).type, "failed");
+  assert.equal(receivedSignal, controller.signal);
+  assert.equal(imports, 0);
 });
 
 test("native provider chooser starts batch in Magpie host and signs in with non-collapsing metadata", async () => {
@@ -298,12 +322,28 @@ test("the only import web UI is Magpie's sandboxed page; old browser tickets are
   } finally { await h.close(); }
 });
 
-test("a GUI port already in use does not fail the plugin load", async () => {
-  // A host restart overlaps the previous host for a moment, and the old
-  // one still holds the GUI port. The pool's provider side needs no GUI
-  // service, so the plugin must load anyway: failing here took the whole
-  // plugin down and left the provider with no endpoint at all.
-  const busy = createGuiService({ port: 0 });
+test("sidebar navigation enters the retryable service root and preserves its action", async () => {
+  const script = await readFile(new URL("../gui/entry.js", import.meta.url), "utf8");
+  for (const service of ["https://magpie.example/service/", undefined]) {
+    const navigated = [];
+    await runInNewContext(script, {
+      URL,
+      magpie: {
+        ready: Promise.resolve(),
+        options: { get: async () => ({ port: 37986 }) },
+        service,
+        onAction: (listener) => listener({ id: "batch-import" }),
+      },
+      document: { querySelector: () => ({ textContent: "" }) },
+      location: { replace: (target) => navigated.push(target) },
+      setTimeout: (callback, delay) => { if (delay === 40) queueMicrotask(callback); },
+    });
+    assert.deepEqual(navigated, [(service || "http://127.0.0.1:37986/") + "#action=batch-import"]);
+  }
+});
+
+test("GUI port handoff keeps the plugin available and restores the menu without reinitializing", async () => {
+  const busy = createGuiService({ port: 0, sessionFile: false });
   const address = await busy.listen();
   const home = await mkdtemp(join(tmpdir(), "magpie-gui-busy-"));
   const before = process.env.MAGPIE_GPTFREE_HOME;
@@ -318,14 +358,45 @@ test("a GUI port already in use does not fail the plugin load", async () => {
       async log({ body }) { logs.push(body); },
     },
   };
+  let initializing, bootTimer;
   try {
-    const loaded = await GPTFreeGuiPlugin({ client }, { port: address.port });
+    initializing = GPTFreeGuiPlugin({ client }, { port: address.port });
+    const loaded = await Promise.race([
+      initializing,
+      new Promise((resolve, reject) => {
+        bootTimer = setTimeout(() => reject(new Error("Plugin initialization waited for the old GUI host")), 2000);
+      }),
+    ]);
+    clearTimeout(bootTimer);
     assert.deepEqual(loaded, {});
-    assert(logs.some((l) => l.level === "warn" && /GUI service could not start/.test(l.message)));
+    await busy.close();
+
+    // Opening the menu must recover without calling the startup API again.
+    let recovered = false;
+    const until = performance.now() + 5000;
+    while (performance.now() < until) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${address.port}/`, {
+          signal: AbortSignal.timeout(500),
+        });
+        await response.arrayBuffer();
+        if (response.status === 200) {
+          recovered = true;
+          break;
+        }
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(recovered, true);
+    assert.equal(logs.filter((log) => log.level === "warn").length, 0);
   } finally {
+    clearTimeout(bootTimer);
+    await busy.close();
+    await initializing?.catch(() => {});
+    const service = await startGuiServer({ port: address.port });
+    await service.close();
     if (before === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
     else process.env.MAGPIE_GPTFREE_HOME = before;
-    await busy.close();
     await rm(home, { recursive: true, force: true });
   }
 });

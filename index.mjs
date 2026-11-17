@@ -39,19 +39,12 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535)
     throw new Error("GPT号池 GUI: invalid service port");
   const connection = ensurePoolConnector(ctx) || createPoolConnector(ctx.client);
-  try {
-    await startGuiServer({ port, onPoolChange: () => connection.sync() });
-  } catch (error) {
-    // The GUI port is normally held by the previous host, which is still
-    // shutting down: a host restart overlaps the two for a moment. The
-    // pool's provider side does not need the GUI service, so the plugin
-    // keeps loading and its models hook stays registered. Letting this
-    // throw failed the whole plugin load, which left the provider with no
-    // endpoint at all ("GPT号池 has no endpoint configured") until the
-    // port was freed by hand.
+  // decision: start the GUI independently; not await port handoff during
+  // plugin loading because a retiring host may still be finishing images.
+  void startGuiServer({ port, onPoolChange: () => connection.sync() }).catch(async (error) => {
+    if (error?.name === "AbortError") return;
     const message = "GPT号池 GUI service could not start (" +
-      String(error?.message || error) + "); the pool provider stays available, " +
-      "the sidebar page is unavailable until the port is free";
+      String(error?.message || error) + "); the pool provider stays available";
     try {
       await ctx?.client?.app?.log?.({
         body: { service: "gptfree", level: "warn", message },
@@ -59,7 +52,7 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
     } catch {
       // A log that cannot be written must not stop the plugin from loading.
     }
-  }
+  });
   // Restore Magpie's per-account local-pool slots automatically after
   // restarting. A corrupt vault must not make the GUI inaccessible.
   try {
@@ -97,7 +90,7 @@ export const GPTFreePoolPlugin = async (ctx = {}) => {
       // Multi-account management stays enabled so every pooled account gets its
       // own toggleable row in Magpie Providers.
       methods: [nativeImportMethod({
-        ...(connector ? { server: () => startGuiServer({ port: GUI_PORT, onPoolChange: () => sharedConnector?.sync() }) } : {}),
+        ...(connector ? { server: ({ signal } = {}) => startGuiServer({ port: GUI_PORT, onPoolChange: () => sharedConnector?.sync(), signal }) } : {}),
         syncPool: () => sharedConnector?.sync(),
         claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
         activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
