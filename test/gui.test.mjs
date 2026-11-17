@@ -683,7 +683,7 @@ test("GUI lifecycle singleton recovers after fatal startup and handles failure a
   });
 });
 
-test("GUI keeps a page usable across a plugin-host restart (persisted capability)", async () => {
+test("GUI keeps existing pages usable while opening the menu after a host restart", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gptfree-session-"));
   const sessionFile = join(dir, "gui-sessions.json");
   const first = createGuiService({ port: 0, sessionFile, poolRead: async () => [] });
@@ -704,14 +704,26 @@ test("GUI keeps a page usable across a plugin-host restart (persisted capability
     // A restarted host (new process, new service) accepts the same open page.
     second = createGuiService({ port: addr.port, sessionFile, poolRead: async () => [] });
     await second.listen();
-    const resumed = await fetch(base + "api/accounts", {
-      headers: { Origin: "null", "X-GPTFree-Session": token },
-    });
-    assert.equal(resumed.status, 200, "an open page survives a host restart");
+    const [menu, ...resumed] = await Promise.all([
+      fetch(base + "ui"),
+      ...Array.from({ length: 3 }, () => fetch(base + "api/accounts", {
+        headers: { Origin: "null", "X-GPTFree-Session": token },
+      })),
+    ]);
+    assert.equal(menu.status, 200);
+    await menu.arrayBuffer();
+    for (const response of resumed) {
+      assert.equal(response.status, 200, "existing pages survive concurrent menu navigation after restart");
+      await response.arrayBuffer();
+    }
     const forged = await fetch(base + "api/accounts", {
       headers: { Origin: "null", "X-GPTFree-Session": "0".repeat(64) },
     });
     assert.equal(forged.status, 403);
+    await forged.arrayBuffer();
+    await second.close();
+    const restored = JSON.parse(await readFile(sessionFile, "utf8"));
+    assert(restored.sessions.some((entry) => entry.id === token));
   } finally {
     await first.close();
     await second?.close();
