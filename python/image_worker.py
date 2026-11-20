@@ -29,9 +29,19 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from curl_cffi import requests
+    from curl_cffi import CurlError, requests
 except ImportError:
+    CurlError = ()
     requests = None
+
+# libcurl SSL_CONNECT_ERROR and RECV_ERROR, respectively.
+_TLS_CONNECT_ERROR = 35
+_RECEIVE_ERROR = 56
+_IMAGE_RESULT_RESERVE_SECS = 15.0
+
+
+def _is_curl_error(exc: Exception, *codes: int) -> bool:
+    return isinstance(exc, CurlError) and exc.code in codes
 
 from utils.turnstile import solve_turnstile_token
 from utils.web_pow import (
@@ -209,6 +219,7 @@ class ConversationState:
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    interrupted: bool = False
 
 
 def resolve_proxy(custom_proxy: str = "") -> str:
@@ -897,6 +908,7 @@ class OpenAIWebImageClient:
         thinking_effort: str = "",
         session: Any = None,
         poll_timeout_secs: float = 150.0,
+        recovery_deadline: float | None = None,
         initial_wait_secs: float = 8.0,
         poll_interval_secs: float = 6.0,
         settle_secs: float = 1.5,
@@ -916,6 +928,7 @@ class OpenAIWebImageClient:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.poll_timeout_secs = max(0.05, float(poll_timeout_secs))
+        self.recovery_deadline = recovery_deadline
         self.initial_wait_secs = max(0.0, float(initial_wait_secs))
         self.poll_interval_secs = max(0.05, float(poll_interval_secs))
         self.settle_secs = max(0.0, float(settle_secs))
@@ -1392,10 +1405,31 @@ class OpenAIWebImageClient:
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
             timeout=300,
+            allow_redirects=False,
             stream=True,
         )
         self._ensure_ok(response, path)
         return response
+
+    def _submit_image(self, prompt: str, references: list[Dict[str, Any]]) -> Any:
+        for attempt in range(2):
+            try:
+                self._bootstrap()
+                requirements = self._get_chat_requirements()
+                conduit_token = self._prepare_image_conversation(prompt, requirements)
+            except Exception as exc:
+                if attempt or not _is_curl_error(exc, _TLS_CONNECT_ERROR, _RECEIVE_ERROR):
+                    raise
+                continue
+            try:
+                return self._start_image_generation(prompt, requirements, conduit_token, references)
+            except Exception as exc:
+                # decision: Retry a failed handshake once; not a receive error
+                # because the upstream may already have accepted the image job;
+                # revisit when the submit supports idempotency or job lookup.
+                if attempt or not _is_curl_error(exc, _TLS_CONNECT_ERROR):
+                    raise
+        raise AssertionError("unreachable image submission state")
 
     def _consume_image_sse(self, response: Any, hard_cap_secs: float) -> ConversationState:
         state = ConversationState()
@@ -1423,12 +1457,15 @@ class OpenAIWebImageClient:
                 state.text = _sanitize_output_text(next_raw)
                 if time.monotonic() >= deadline:
                     raise ImageStreamHardTimeoutError(timeout_msg, state.conversation_id)
-        except ImageStreamHardTimeoutError:
-            raise
         except Exception as exc:
-            if time.monotonic() >= deadline:
-                raise ImageStreamHardTimeoutError(timeout_msg, state.conversation_id) from exc
-            raise
+            timed_out = isinstance(exc, ImageStreamHardTimeoutError) or time.monotonic() >= deadline
+            if not timed_out and not _is_curl_error(exc, _RECEIVE_ERROR):
+                raise
+            if not (state.conversation_id or state.file_ids or state.sediment_ids or state.blocked):
+                if timed_out:
+                    raise ImageStreamHardTimeoutError(timeout_msg) from exc
+                raise
+            state.interrupted = True
         finally:
             if watchdog is not None:
                 watchdog.cancel()
@@ -1439,12 +1476,12 @@ class OpenAIWebImageClient:
                     pass
         return state
 
-    def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_conversation(self, conversation_id: str, timeout_secs: float) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "application/json"}),
-            timeout=60,
+            timeout=timeout_secs,
         )
         self._ensure_ok(response, path)
         return response.json()
@@ -1539,13 +1576,13 @@ class OpenAIWebImageClient:
                 error_msg = "".join(p for p in parts if isinstance(p, str))
         return is_error, error_msg
 
-    def _get_detailed_task_error(self, conversation_id: str, wait_secs: float = 0.0) -> str:
+    def _get_detailed_task_error(self, conversation_id: str, wait_secs: float = 0.0, timeout_secs: float = 5.0) -> str:
         if not conversation_id:
             return ""
         try:
             if wait_secs > 0:
                 time.sleep(wait_secs)
-            for task in self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0):
+            for task in self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=timeout_secs):
                 is_error, error_msg = self.check_task_error(task)
                 if is_error and error_msg:
                     return error_msg
@@ -1639,9 +1676,12 @@ class OpenAIWebImageClient:
         last_task_error = ""
         while _remaining() > 0:
             attempt += 1
-            last_task_error = self._get_detailed_task_error(conversation_id, wait_secs=0.0)
+            last_task_error = self._get_detailed_task_error(conversation_id, timeout_secs=min(5.0, _remaining()))
+            remaining = _remaining()
+            if remaining <= 0:
+                break
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = self._get_conversation(conversation_id, timeout_secs=min(60.0, remaining))
             except UpstreamHTTPError as exc:
                 if exc.status_code in (429, 500, 502, 503, 504):
                     base = exc.retry_after if exc.retry_after is not None else min(2 ** min(attempt, 4), 16)
@@ -1683,6 +1723,8 @@ class OpenAIWebImageClient:
             if wait > 0:
                 time.sleep(wait)
 
+        if file_ids or sediment_ids:
+            return file_ids, sediment_ids
         if refusal := _image_text_refusal(last_task_error, conversation_id):
             raise refusal
         raise ImagePollTimeoutError(
@@ -1875,10 +1917,7 @@ class OpenAIWebImageClient:
                 frame_duration_ms=frame_duration_ms,
             )
             started_at = time.time()
-            self._bootstrap()
-            requirements = self._get_chat_requirements()
-            conduit_token = self._prepare_image_conversation(final_prompt, requirements)
-            sse_resp = self._start_image_generation(final_prompt, requirements, conduit_token, references)
+            sse_resp = self._submit_image(final_prompt, references)
             state = self._consume_image_sse(sse_resp, self.poll_timeout_secs)
 
             conversation_id = state.conversation_id
@@ -1886,7 +1925,7 @@ class OpenAIWebImageClient:
             sediment_ids = list(state.sediment_ids)
             message = state.text.strip()
 
-            if message and not file_ids and not sediment_ids and state.blocked:
+            if not file_ids and not sediment_ids and state.blocked:
                 detailed = self._get_detailed_task_error(conversation_id, wait_secs=min(1.0, self.settle_secs))
                 raise ImageContentPolicyError(detailed or message, conversation_id)
 
@@ -1895,7 +1934,8 @@ class OpenAIWebImageClient:
                     raise quota
 
             is_text_reply = bool(message and _is_model_text_reply_instead_of_image(message))
-            should_poll = bool(references) or state.turn_use_case == "image gen" or is_text_reply
+            image_started = state.tool_invoked is True or state.turn_use_case == "image gen"
+            should_poll = bool(references) or image_started or state.interrupted or is_text_reply
 
             if message and not file_ids and not sediment_ids and not should_poll:
                 if _is_content_policy_error(message):
@@ -1907,7 +1947,7 @@ class OpenAIWebImageClient:
                     conversation_id=conversation_id,
                 )
 
-            if should_poll and not conversation_id:
+            if should_poll and not conversation_id and not state.interrupted:
                 conversation_id = self.find_conversation_by_prompt(final_prompt, started_at, timeout_secs=5.0)
 
             if not file_ids and not sediment_ids and conversation_id and not should_poll:
@@ -1923,14 +1963,18 @@ class OpenAIWebImageClient:
                     )
 
             if conversation_id and ((not file_ids and not sediment_ids) or self.settle_secs > 0):
-                polled_files, polled_sediments = self._poll_image_results(
-                    conversation_id,
-                    file_ids,
-                    sediment_ids,
-                    timeout_secs=self.poll_timeout_secs,
-                )
-                _add_unique(file_ids, polled_files)
-                _add_unique(sediment_ids, polled_sediments)
+                poll_window = self.poll_timeout_secs
+                if self.recovery_deadline is not None:
+                    available = max(0.0, self.recovery_deadline - time.monotonic() - _IMAGE_RESULT_RESERVE_SECS)
+                    # decision: Give a known job more of the existing deadline;
+                    # not submit a replacement while its result may still arrive.
+                    poll_window = available if image_started or state.interrupted else min(poll_window, available)
+                if poll_window > 0 or not (file_ids or sediment_ids):
+                    polled_files, polled_sediments = self._poll_image_results(
+                        conversation_id, file_ids, sediment_ids, timeout_secs=poll_window,
+                    )
+                    _add_unique(file_ids, polled_files)
+                    _add_unique(sediment_ids, polled_sediments)
 
             if not file_ids and not sediment_ids:
                 raise ImageWorkerError(
@@ -2077,6 +2121,10 @@ def handle_payload(data: Any, *, session: Any = None) -> Dict[str, Any]:
         if masks and not images:
             raise ImageWorkerError("Mask requires at least one input image", http_status=400, error_code="invalid_request")
         poll_timeout = max(0.05, min(300.0, float(data.get("poll_timeout_secs") or 150.0)))
+        recovery_deadline = None
+        budget = data.get("execution_budget_secs")
+        if type(budget) in (int, float) and 0 < budget <= 300 and data.get("poll_timeout_secs") is None:
+            recovery_deadline = time.monotonic() + budget
         initial_wait = max(0.0, min(60.0, float(data.get("initial_wait_secs") if data.get("initial_wait_secs") is not None else 8.0)))
         poll_interval = max(0.05, min(30.0, float(data.get("poll_interval_secs") if data.get("poll_interval_secs") is not None else 6.0)))
         settle_secs = max(0.0, min(10.0, float(data.get("settle_secs") if data.get("settle_secs") is not None else 1.5)))
@@ -2089,6 +2137,7 @@ def handle_payload(data: Any, *, session: Any = None) -> Dict[str, Any]:
             thinking_effort=str(data.get("thinking_effort") or "").strip(),
             session=session,
             poll_timeout_secs=poll_timeout,
+            recovery_deadline=recovery_deadline,
             initial_wait_secs=initial_wait,
             poll_interval_secs=poll_interval,
             settle_secs=settle_secs,

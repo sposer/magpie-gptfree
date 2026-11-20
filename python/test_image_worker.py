@@ -7,6 +7,7 @@ import json
 import struct
 import unittest
 import zlib
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -450,6 +451,88 @@ class ImageWorkerUnitTests(unittest.TestCase):
                 else:
                     self.assertEqual((result["http_status"], result["error_code"], result.get("retry_after")),
                                      (429, "rate_limited", 3 * 3600))
+
+    def test_transient_image_failures_recover_without_duplicate_submission(self):
+        class TransportError(RuntimeError):
+            def __init__(self, code):
+                self.code = code
+
+        class InterruptedResponse(FakeResponse):
+            def iter_lines(self):
+                yield from super().iter_lines()
+                raise TransportError(56)
+
+        png = _make_rgba_png(1, 1, [(1, 2, 3, 255)])
+        asset = "file_00000000111122223333444455556666"
+        conversation_event = "data: " + json.dumps({"conversation_id": "conv-recover"})
+        tool_event = "data: " + json.dumps({
+            "type": "server_ste_metadata", "metadata": {"tool_invoked": True},
+        })
+        text_event = "data: " + json.dumps({"message": {
+            "author": {"role": "assistant"}, "channel": "final",
+            "content": {"content_type": "text", "parts": ["Generating your image."]},
+        }})
+        for mode in ("handshake", "interrupted", "accepted_slow", "pending_timeout", "ambiguous_submit", "plain_text"):
+            with self.subTest(mode=mode):
+                clock = 1000.0
+                submits = 0
+
+                def advance_clock(seconds):
+                    nonlocal clock
+                    clock += seconds
+
+                def handler(method, url, kwargs):
+                    nonlocal submits
+                    if method == "GET" and url == "https://chatgpt.com/":
+                        return FakeResponse(text="<html></html>")
+                    if method == "POST" and url.endswith("/prepare"):
+                        return FakeResponse(json_data={"prepare_token": "p", "conduit_token": "c"})
+                    if method == "POST" and url.endswith("/finalize"):
+                        return FakeResponse(json_data={"token": "t"})
+                    if method == "POST" and url.endswith("/f/conversation"):
+                        submits += 1
+                        if mode == "ambiguous_submit" or (mode == "handshake" and submits == 1):
+                            raise TransportError(56 if mode == "ambiguous_submit" else 35)
+                        if mode == "interrupted":
+                            return InterruptedResponse(lines=[conversation_event, text_event])
+                        events = [conversation_event, text_event]
+                        if mode != "plain_text":
+                            events.append(tool_event)
+                        return FakeResponse(lines=[*events, "data: [DONE]"])
+                    if method == "GET" and url.endswith("/backend-api/tasks"):
+                        return FakeResponse(json_data={"tasks": []})
+                    if method == "GET" and url.endswith("/conversation/conv-recover"):
+                        if mode == "pending_timeout" or (mode == "accepted_slow" and clock < 1160):
+                            return FakeResponse(json_data={"mapping": {}})
+                        message = {"author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                                   "content": {"parts": [{"content_type": "image_asset_pointer",
+                                                          "asset_pointer": f"file-service://{asset}"}]}}
+                        return FakeResponse(json_data={"mapping": {"img": {"message": message}}})
+                    if method == "GET" and url.endswith(f"/files/{asset}/download"):
+                        return FakeResponse(json_data={"download_url": "https://files.example.com/image.png"})
+                    if method == "GET" and url == "https://files.example.com/image.png":
+                        return FakeResponse(content=png)
+                    raise AssertionError(f"Unexpected call: {method} {url}")
+
+                with (patch.object(image_worker, "CurlError", TransportError),
+                      patch.object(image_worker.time, "monotonic", lambda: clock),
+                      patch.object(image_worker.time, "sleep", advance_clock)):
+                    result = image_worker.handle_payload({
+                        "action": "generate_image", "access_token": "tok", "prompt": "owl",
+                        "cleanup_conversation": False, "initial_wait_secs": 0, "settle_secs": 0,
+                        "execution_budget_secs": 220.0,
+                    }, session=FakeSession(handler))
+                if mode in {"ambiguous_submit", "plain_text"}:
+                    self.assertEqual(result["http_status"], 502)
+                    if mode == "plain_text":
+                        self.assertEqual(result["error_code"], "upstream_text_reply")
+                elif mode == "pending_timeout":
+                    self.assertEqual((result["http_status"], result["error_code"]), (504, "timeout"))
+                    self.assertLess(clock, 1220.0)
+                else:
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(base64.b64decode(result["data"][0]["b64_json"]), png)
+                self.assertEqual(submits, 2 if mode == "handshake" else 1)
 
     def test_estuary_download_isolates_headers_and_deduplicates_same_asset_id(self):
         output_png = _make_rgba_png(2, 2, [(9, 8, 7, 255)] * 4)
