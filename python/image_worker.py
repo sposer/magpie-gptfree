@@ -97,6 +97,9 @@ SEDIMENT_ID_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
 TOOL_PARAMS_JSON_RE = re.compile(r'\{\s*"size"\s*:\s*"\d+x\d+"\s*,\s*"n"\s*:\s*\d+\s*\}')
 
+_IMAGE_QUOTA_NOTICE = re.compile(r"^你已达到\s*Free\s*套餐的图像生成请求上限(?:[。！!]|$)", re.IGNORECASE)
+_IMAGE_QUOTA_RESET = re.compile(r"上限将在\s*([0-9]{1,3})\s*(小时|分钟)\s*后重置")
+
 _CONTENT_POLICY_KEYWORDS = (
     "内容政策",
     "防护限制",
@@ -236,6 +239,25 @@ def _sanitize_error_text(text: str, limit: int = 300) -> str:
     if not s:
         return "Image generation failed"
     return s[:limit]
+
+
+def _image_quota_error(message: str, conversation_id: str) -> ImageWorkerError | None:
+    # decision: Match the observed limit notice; not generic inability to draw
+    # because moderation and normal text replies also use that wording.
+    if not _IMAGE_QUOTA_NOTICE.match(message.strip()):
+        return None
+    reset = _IMAGE_QUOTA_RESET.search(message)
+    retry_after = int(reset[1]) * (3600 if reset[2] == "小时" else 60) if reset else None
+    return ImageWorkerError(message, http_status=429, error_code="rate_limited",
+                            conversation_id=conversation_id, retry_after=retry_after or None)
+
+
+def _image_text_refusal(message: str, conversation_id: str) -> ImageWorkerError | None:
+    if quota := _image_quota_error(message, conversation_id):
+        return quota
+    if _is_content_policy_error(message):
+        return ImageContentPolicyError(message, conversation_id)
+    return None
 
 
 def _is_token_invalid_text(text: str) -> bool:
@@ -1561,7 +1583,7 @@ class OpenAIWebImageClient:
         return sorted(records, key=lambda item: float(item["create_time"] or 0))
 
     @staticmethod
-    def _find_content_policy_error_in_conversation(data: Dict[str, Any]) -> str:
+    def _find_image_refusal(data: Dict[str, Any], conversation_id: str) -> ImageWorkerError | None:
         mapping = data.get("mapping") or {}
         for node in mapping.values():
             message = (node or {}).get("message") or {}
@@ -1580,9 +1602,9 @@ class OpenAIWebImageClient:
             elif isinstance(content, str) and content.strip():
                 text_parts.append(content.strip())
             msg_text = "\n".join(text_parts)
-            if msg_text and _is_content_policy_error(msg_text):
-                return msg_text[:500]
-        return ""
+            if refusal := _image_text_refusal(msg_text, conversation_id):
+                return refusal
+        return None
 
     def _poll_image_results(
         self,
@@ -1641,9 +1663,10 @@ class OpenAIWebImageClient:
                 _add_unique(sediment_ids, record["sediment_ids"])
 
             if not file_ids and not sediment_ids:
-                policy_msg = self._find_content_policy_error_in_conversation(conversation)
-                if policy_msg:
-                    raise ImageContentPolicyError(policy_msg, conversation_id)
+                if refusal := self._find_image_refusal(conversation, conversation_id):
+                    raise refusal
+                if quota := _image_quota_error(last_task_error, conversation_id):
+                    raise quota
 
             if file_ids or sediment_ids:
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
@@ -1660,8 +1683,8 @@ class OpenAIWebImageClient:
             if wait > 0:
                 time.sleep(wait)
 
-        if last_task_error and _is_content_policy_error(last_task_error):
-            raise ImageContentPolicyError(last_task_error, conversation_id)
+        if refusal := _image_text_refusal(last_task_error, conversation_id):
+            raise refusal
         raise ImagePollTimeoutError(
             f"ChatGPT image polling timed out after {int(timeout_secs)}s",
             conversation_id=conversation_id,
@@ -1867,6 +1890,10 @@ class OpenAIWebImageClient:
                 detailed = self._get_detailed_task_error(conversation_id, wait_secs=min(1.0, self.settle_secs))
                 raise ImageContentPolicyError(detailed or message, conversation_id)
 
+            if not file_ids and not sediment_ids:
+                if quota := _image_quota_error(message, conversation_id):
+                    raise quota
+
             is_text_reply = bool(message and _is_model_text_reply_instead_of_image(message))
             should_poll = bool(references) or state.turn_use_case == "image gen" or is_text_reply
 
@@ -1886,8 +1913,8 @@ class OpenAIWebImageClient:
             if not file_ids and not sediment_ids and conversation_id and not should_poll:
                 detailed = self._get_detailed_task_error(conversation_id, wait_secs=min(0.5, self.settle_secs))
                 if detailed:
-                    if _is_content_policy_error(detailed):
-                        raise ImageContentPolicyError(detailed, conversation_id)
+                    if refusal := _image_text_refusal(detailed, conversation_id):
+                        raise refusal
                     raise ImageWorkerError(
                         _sanitize_error_text(detailed),
                         http_status=502,

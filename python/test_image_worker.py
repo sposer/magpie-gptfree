@@ -406,6 +406,51 @@ class ImageWorkerUnitTests(unittest.TestCase):
         self.assertEqual(res_policy["http_status"], 400)
         self.assertEqual(res_policy["error_code"], "content_policy_violation")
 
+    def test_explicit_image_quota_notices_are_rate_limited(self):
+        notice = "你已达到 Free 套餐的图像生成请求上限。上限将在 3小时 后重置，届时可创建更多图像。 暂时无法生成 PNG 图片。"
+        for source in ("stream", "conversation", "task", "moderation"):
+            with self.subTest(source=source):
+                message = {"author": {"role": "assistant"}, "channel": "final",
+                           "content": {"content_type": "text", "parts": [notice]}}
+
+                def handler(method, url, kwargs):
+                    if method == "GET" and url == "https://chatgpt.com/":
+                        return FakeResponse(text="<html></html>")
+                    if method == "POST" and url.endswith("/prepare"):
+                        return FakeResponse(json_data={"prepare_token": "p", "conduit_token": "c"})
+                    if method == "POST" and url.endswith("/finalize"):
+                        return FakeResponse(json_data={"token": "t"})
+                    if method == "POST" and url.endswith("/f/conversation"):
+                        event = {"conversation_id": "conv-limit"}
+                        if source in {"stream", "moderation"}:
+                            event["message"] = message
+                        else:
+                            event.update(type="server_ste_metadata", metadata={"turn_use_case": "image gen"})
+                        events = [event]
+                        if source == "moderation":
+                            events.append({"type": "moderation", "moderation_response": {"blocked": True}})
+                        return FakeResponse(lines=[*("data: " + json.dumps(e) for e in events), "data: [DONE]"])
+                    if method == "GET" and url.endswith("/backend-api/tasks"):
+                        tasks = [{"conversation_id": "conv-limit", "image_gen_message": {
+                            **message, "metadata": {"is_error": True},
+                        }}] if source == "task" else []
+                        return FakeResponse(json_data={"tasks": tasks})
+                    if method == "GET" and url.endswith("/conversation/conv-limit") and source in {"conversation", "task"}:
+                        mapping = {"msg": {"message": message}} if source == "conversation" else {}
+                        return FakeResponse(json_data={"mapping": mapping})
+                    raise AssertionError(f"Unexpected call: {method} {url}")
+
+                result = image_worker.handle_payload({
+                    "action": "generate_image", "access_token": "tok", "prompt": "owl",
+                    "cleanup_conversation": False, "initial_wait_secs": 0, "settle_secs": 0,
+                    "poll_timeout_secs": 0.05,
+                }, session=FakeSession(handler))
+                if source == "moderation":
+                    self.assertEqual((result["http_status"], result["error_code"]), (400, "content_policy_violation"))
+                else:
+                    self.assertEqual((result["http_status"], result["error_code"], result.get("retry_after")),
+                                     (429, "rate_limited", 3 * 3600))
+
     def test_estuary_download_isolates_headers_and_deduplicates_same_asset_id(self):
         output_png = _make_rgba_png(2, 2, [(9, 8, 7, 255)] * 4)
         estuary_url = "https://chatgpt.com/backend-api/estuary/content?id=file_00000000aaaabbbbccccdddd11112222&sig=abc"
