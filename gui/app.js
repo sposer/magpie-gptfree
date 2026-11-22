@@ -353,6 +353,19 @@
         title: account.quotaResetAt ? formatTime(account.quotaResetAt, "预计恢复 ") : "上游返回剩余额度为 0",
       };
     }
+    if (status === "forbidden") {
+      const resting = account.forbiddenResting === true;
+      const reason = `chatgpt.com 已连续 ${account.forbiddenCount || 1} 次以 403 拒绝该账号，多为它在 Magpie 中的代理出口被拦截`;
+      return {
+        cls: "bad",
+        pillText: resting ? "上游拒绝 · 休息中" : "上游拒绝 · 下次重试",
+        statusLabel: resting ? "被拒休息中" : "被拒待重试",
+        quotaCell: typeof account.imageQuota === "number" ? String(account.imageQuota) : "—",
+        title: resting
+          ? `${reason}；${formatTime(account.forbiddenUntil, "休息至 ")}`
+          : `${reason}；休息已结束，下次生图会重试`,
+      };
+    }
     if (status === "needs_renew") {
       return {
         cls: "warn",
@@ -501,6 +514,7 @@
     const totalAccounts = Number(qs.total ?? accounts.length ?? 0);
     const activeAccounts = Number(qs.active ?? 0);
     const limitedAccounts = Number(qs.limited ?? 0);
+    const forbiddenAccounts = Number(qs.forbidden ?? 0);
     const uncheckedAccounts = Number(qs.unchecked ?? 0);
     const erroredAccounts = Number(qs.errored ?? 0);
     const totalQuota = Number(qs.totalQuota ?? 0);
@@ -521,7 +535,7 @@
         ? `其中 ${erroredAccounts} 个账号额度查询失败`
         : "从上游状态接口读取";
     $("statsMeta").textContent = totalAccounts
-      ? `共 ${totalAccounts} 个账号 · 可用 ${activeAccounts} · 限流 ${limitedAccounts} · 待检测 ${uncheckedAccounts}${erroredAccounts ? ` · 查询失败 ${erroredAccounts}` : ""}`
+      ? `共 ${totalAccounts} 个账号 · 可用 ${activeAccounts} · 限流 ${limitedAccounts}${forbiddenAccounts ? ` · 被拒 ${forbiddenAccounts}` : ""} · 待检测 ${uncheckedAccounts}${erroredAccounts ? ` · 查询失败 ${erroredAccounts}` : ""}`
       : "号池暂无账号 · 请先在「批量导入」添加账号";
 
     if ($("refreshStatsQuota")) {
@@ -535,6 +549,9 @@
     } else if (erroredAccounts > 0 && activeAccounts === 0) {
       hint.classList.remove("hidden");
       hint.textContent = "部分或全部账号查询生图额度失败：登录走 auth.openai.com，而生图额度查询需访问 chatgpt.com。请确认本机 HTTP(S) 代理可访问 chatgpt.com 后点击「刷新全部额度」。";
+    } else if (forbiddenAccounts > 0) {
+      hint.classList.remove("hidden");
+      hint.textContent = `${forbiddenAccounts} 个账号生图被 chatgpt.com 以 403 拒绝，多为该账号在 Magpie 中的代理出口被拦截。插件让它逐次加长休息（1 分钟起，最长 30 分钟），期间由 Magpie 直接换号；生图成功后恢复。`;
     } else if (uncheckedAccounts > 0) {
       hint.classList.remove("hidden");
       hint.textContent = `当前有 ${uncheckedAccounts} 个账号尚未获取 chatgpt.com 生图额度，可点击右上角「刷新全部额度」实时检测（不会伪造或估算数值）。`;
@@ -612,7 +629,7 @@
     const qs = data.quotaStats || {};
     if (data.total) {
       const quotaSeg = qs.checked > 0
-        ? ` · 生图可用 ${qs.active ?? 0} · 限流 ${qs.limited ?? 0} · 剩余额度 ${qs.totalQuota ?? 0}`
+        ? ` · 生图可用 ${qs.active ?? 0} · 限流 ${qs.limited ?? 0}${qs.forbidden ? ` · 被拒 ${qs.forbidden}` : ""} · 剩余额度 ${qs.totalQuota ?? 0}`
         : ` · 生图额度待检测`;
       $("poolSummary").textContent =
         `共 ${summary.total} 个入池账号 · 有效 ${summary.valid} · 待续期/异常 ${summary.needsRenew}${quotaSeg}`;

@@ -796,6 +796,55 @@ test("native image routing preserves account refusal, cooldown and per-account s
   assert.equal(summary.quotaStats.totalFail, 1);
 });
 
+test("an upstream 403 rests its slot, answers locally while resting and ends on the next drawing", async () => {
+  const account = { email: "refused@example.com", accessToken: jwt(3600, "refused@example.com") };
+  const slot = accountSlotTag(account.email);
+  const statsStore = createInMemoryStatsStore();
+  const refusal = { ok: false, http_status: 403, error_code: "forbidden", error: "Forbidden" };
+  const outcomes = [refusal, refusal, { ok: true, data: [{ b64_json: "cG5n", media_type: "image/png" }] }];
+  let calls = 0;
+  const draw = () => poolFetch(CODEX_BASE + "/images/generations", {
+    method: "POST", body: JSON.stringify({ model: IMAGE_MODEL_ID, prompt: "owl" }),
+  }, {
+    read: async () => [account], preferredSlot: slot, statsStore,
+    runWorker: async () => outcomes[calls++],
+  });
+  const summarize = async () => summarizePoolStats([account], await readPoolStats({ statsStore }));
+  const endRest = () => {
+    statsStore.state.accounts[slot].forbiddenUntil = new Date(Date.now() - 1000).toISOString();
+  };
+
+  assert.equal((await draw()).status, 403);
+  assert.equal(calls, 1);
+  let summary = await summarize();
+  assert.equal(summary.quotaStats.forbidden, 1);
+  assert.equal(summary.accounts[0].quotaStatus, "forbidden");
+  assert.equal(summary.accounts[0].forbiddenResting, true);
+
+  const resting = await draw();
+  assert.equal(resting.status, 403);
+  assert.equal((await resting.json()).error.code, "forbidden");
+  const retryAfter = Number(resting.headers.get("retry-after"));
+  assert(retryAfter > 0 && retryAfter <= 60);
+  assert.equal(calls, 1);
+
+  endRest();
+  assert.equal((await draw()).status, 403);
+  assert.equal(calls, 2);
+  summary = await summarize();
+  assert.equal(summary.accounts[0].forbiddenCount, 2);
+  const restMs = Date.parse(summary.accounts[0].forbiddenUntil) - Date.now();
+  assert(restMs > 60_000 && restMs <= 120_000);
+
+  endRest();
+  assert.equal((await draw()).status, 200);
+  assert.equal(calls, 3);
+  summary = await summarize();
+  assert.equal(summary.quotaStats.forbidden, 0);
+  assert.equal(summary.accounts[0].forbiddenCount, 0);
+  assert.notEqual(summary.accounts[0].quotaStatus, "forbidden");
+});
+
 test("a slot with an expired or unknown quota reset can recover by trying upstream", async () => {
   const account = { email: "recover@example.com", accessToken: jwt(3600) };
   const statsStore = createInMemoryStatsStore();
